@@ -1,6 +1,12 @@
-# RP2350 硬件自动化执行端固件
-# 对应说明书：[说明书]
-# 功能：将开发板伪装成纯硬件键鼠，接收来自电脑串口的文本指令并执行物理操作
+# -----------------------------------------------------------------------------------
+# 脚本名称：code.py
+# 适用硬件：树莓派 RP2350 (Pico 2)
+# 对应文档：[说明书] -> 硬件级键鼠自动化案例
+# -----------------------------------------------------------------------------------
+# 【核心原理】
+# 此脚本运行在开发板上，它的作用是将 RP2350 伪装成一个纯物理的“USB复合设备（键盘+鼠标）”。
+# Windows 系统会认为这是一个真实的人类在操作，因此拥有极高的硬件级权限。
+# 它充当“执行手”的角色，被动接收来自电脑串口的文本指令，并将其翻译为物理按键/鼠标动作。
 # -----------------------------------------------------------------------------------
 
 import usb_hid
@@ -12,21 +18,24 @@ import usb_cdc
 import supervisor
 import time
 
-# [初始化硬件对象]
-# 这里的 mouse 和 kbd 就是 Windows 设备管理器里看到的“硬件设备”
-# 它们的操作权限极高，属于物理层面的输入
+# =========================================================================
+# [1] 硬件对象初始化 (设备伪装)
+# =========================================================================
+# 在此处实例化后，Windows 设备管理器中就会出现“HID Keyboard Device”和“HID-compliant mouse”。
+# 这里的 serial 对象通过 USB 线建立虚拟串口，用于监听电脑发来的指令。
 mouse = Mouse(usb_hid.devices)
 kbd = Keyboard(usb_hid.devices)
 layout = KeyboardLayoutUS(kbd)
-serial = usb_cdc.console  # 获取串口对象，用于监听电脑发来的指令
+serial = usb_cdc.console
 
-print("RP2350 Composite Ready (Mouse + Keyboard) - 等待指令中...")
+print("RP2350 硬件自动化执行端已就绪 - 正在监听串口指令...")
 
 buffer = ""
 
-# [按键映射表]
-# 将字符串指令映射到 CircuitPython 的按键对象
-# 如果需要更多特殊键（如 F1-F12），可以在此处添加
+# =========================================================================
+# [2] 按键映射表
+# =========================================================================
+# 将串口收到的字符串指令（如 "enter"）映射为 CircuitPython 的物理按键对象。
 KEY_MAP = {
     'shift': Keycode.SHIFT,
     'ctrl': Keycode.CONTROL,
@@ -36,70 +45,69 @@ KEY_MAP = {
     'backspace': Keycode.BACKSPACE,
     'tab': Keycode.TAB,
     'esc': Keycode.ESCAPE,
-    'u': Keycode.U # 专门为了配合说明书中提到的“Unicode输入法”准备（Shift+U）
+    # 下面这个 'u' 键非常关键，它是说明书中提到的“Unicode输入模式”的触发键
+    'u': Keycode.U 
 }
 
-# [主循环]
-# 这是一个死循环，开发板会一直在这里监听串口数据
+# =========================================================================
+# [3] 主循环 (指令监听与执行)
+# =========================================================================
 while True:
+    # 检查串口是否有数据流入
     if serial.in_waiting > 0:
         try:
-            # 逐字节读取串口数据，直到遇到换行符 '\n' 才算一条完整指令
+            # 逐字节读取并拼凑指令，以换行符 '\n' 作为指令结束标志
             char = serial.read(1).decode("utf-8")
             if char == "\n":
                 cmd = buffer.strip()
                 buffer = ""
-                parts = cmd.split(",") # 指令协议规定用逗号分隔，例如：m,100,200
+                # 通信协议：指令类型,参数1,参数2... (例如: m,100,200)
+                parts = cmd.split(",") 
                 action = parts[0]
 
-                # -----------------------------------------------------------
-                # 协议分支 A：鼠标操作
-                # -----------------------------------------------------------
+                # --- 分支 A：鼠标物理操作 ---
                 if action == 'm' and len(parts) == 3:
-                    # 指令格式：m,x,y -> 移动鼠标相对距离
+                    # 指令: m,x,y -> 鼠标相对移动 (用于移动到 OpenCV 识别到的坐标)
                     mouse.move(x=int(parts[1]), y=int(parts[2]))
                 elif action == 'c':
-                    # 指令格式：c -> 鼠标左键点击一次
+                    # 指令: c -> 鼠标左键点击
                     mouse.click(Mouse.LEFT_BUTTON)
                 
-                # -----------------------------------------------------------
-                # 协议分支 B：键盘操作
-                # -----------------------------------------------------------
-                # 指令格式：w,text -> 直接输入纯ASCII文本
-                # 用于输入数字、英文符号等不需要输入法处理的内容
+                # --- 分支 B：键盘文本输出 ---
+                # 指令: w,text -> 快速输入纯 ASCII 字符 (如英文、数字、标点)
+                # 注意：此模式无法直接输入中文，中文需要走下方的 combo 模式
                 elif action == 'w' and len(parts) >= 2:
-                    text_to_write = ",".join(parts[1:]) # 重新拼接，防止文本内容本身包含逗号
+                    text_to_write = ",".join(parts[1:]) # 修复内容中包含逗号的情况
                     layout.write(text_to_write)
                 
-                # 指令格式：k,key_name -> 按下单个功能键
-                # 例如：k,enter (回车), k,space (空格)
+                # --- 分支 C：单个功能键 ---
+                # 指令: k,key_name -> 按下并松开某个功能键 (如回车、空格)
                 elif action == 'k' and len(parts) == 2:
                     key_name = parts[1].lower()
                     if key_name in KEY_MAP:
                         kbd.send(KEY_MAP[key_name])
                 
-                # 指令格式：combo,modifier,key -> 组合键操作
-                # 这是实现“说明书”中特色功能 [3] 的核心：
-                # 通过发送 combo,shift,u 呼出雾凇拼音的 Unicode 输入框
+                # --- 分支 D：组合键操作 (中文输入核心) ---
+                # 指令: combo,modifier,key -> 组合按键
+                # 对应说明书特色功能：通过发送 "combo,shift,u" 呼出雾凇拼音的 Unicode 输入框
+                # 这是实现“无剪贴板依赖”输入中文的底层硬件基础
                 elif action == 'combo' and len(parts) >= 3:
                     modifiers = []
                     target_key = None
                     valid = True
                     
-                    # 1. 解析修饰键 (shift, ctrl...)
+                    # 解析修饰键 (如 shift)
                     for k in parts[1:-1]:
                         if k in KEY_MAP: modifiers.append(KEY_MAP[k])
                         else: valid = False
                     
-                    # 2. 解析最后一个主键
+                    # 解析主键 (如 u)
                     last = parts[-1]
                     if last in KEY_MAP: target_key = KEY_MAP[last]
-                    elif len(last) == 1: 
-                        # 简单的容错处理
-                        pass 
+                    elif len(last) == 1: pass 
                     else: valid = False
 
-                    # 3. 执行组合键：按下修饰键 -> 按下主键 -> 全部松开
+                    # 执行物理按键序列：按下修饰键 -> 按下主键 -> 全部释放
                     if valid and target_key:
                         kbd.press(*modifiers)
                         kbd.press(target_key)
@@ -107,6 +115,6 @@ while True:
 
             else:
                 buffer += char
-        except Exception as e:
+        except Exception:
+            # 发生通信错误时清空缓冲区，防止错误指令堆积
             buffer = ""
-            # print(e) # 调试时可开启，生产环境建议关闭以免干扰通信
